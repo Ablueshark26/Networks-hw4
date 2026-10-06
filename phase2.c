@@ -12,17 +12,16 @@
 #include <stdint.h> //usage for special integer 32 bit
 #include <pthread.h> //thread
 
-//use port 43024
-//#define ADDR "127.0.0.1"   // loop back to this machine
+//use port 43000-43100
 #define ADDR "127.0.0.1"
-#define BACKLOG 3    // How many addresses we store
+#define BACKLOG 3    // How many pending addresses we store
 #define SEND_FILE "blockchain.txt"
-#define MAX_SIZE 1000000 //10mb max
+#define MAX_SIZE 10000000 //10mb max
 
 //start threading
 pthread_mutex_t file_lock = PTHREAD_MUTEX_INITIALIZER;
 time_t saved_mtime; //last save
-int running = 0;  //check when threads are running
+int running = 1;  //check when threads are running
 
 
 
@@ -84,7 +83,7 @@ char *read_file(const char *path, long *len)
 		return NULL;
 	}
  
-	char *buf = malloc(size + 1); //+1 for end character
+	char *buf = malloc(size + 1); //add one for end character
 	if(buf == NULL) {
 		fclose(fp);
 		return NULL;
@@ -92,7 +91,6 @@ char *read_file(const char *path, long *len)
  
 	size_t need = fread(buf, 1, size, fp); //reading and putting in buf
 	fclose(fp);
- 
 	buf[need] = '\0'; //end character to buf
 	*len = (long)need; //writes to len 
 	return buf;
@@ -203,7 +201,7 @@ int recv_file(int fd)
 		return -1;
 	}
  
-	if(recvall(fd, data, len) == -1) { //then the bytes, again OUTSIDE the lock
+	if(recvall(fd, data, len) == -1) {
 		free(data);
 		return -1;
 	}
@@ -211,8 +209,8 @@ int recv_file(int fd)
 	pthread_mutex_lock(&file_lock);
 	int rv = write_file(SEND_FILE, data, len);
 	saved_mtime = file_mtime(SEND_FILE); //write to main
-	pthread_mutex_unlock(&file_lock); //(this one line is what stops the feedback loop)
-	free(data);
+	pthread_mutex_unlock(&file_lock); //releases after writing
+	free(data); //free data from write
 	return rv;
 }
 void *receiver(void *arg)
@@ -253,7 +251,7 @@ void *monitor(void *arg)
 		}
 		pthread_mutex_unlock(&file_lock);
  
-		if(data != NULL) { //send OUTSIDE the lock
+		if(data != NULL) { //send from other
 			printf("Local change detected, sending %s (%ld bytes)\n", SEND_FILE, len);
 			int rv = send_data(fd, data, len);
 			free(data);
@@ -427,8 +425,6 @@ int main(int argc, char *argv[])
 			fprintf(stderr, "Could not receive file.\n");
 			return 2;
 		} 
- 
- 		//gets message from host
         	printf("Received %s (%ld bytes)\n", SEND_FILE, file_size(SEND_FILE));
  
 		run_peer(sockfd); //keeping socket open 
