@@ -7,11 +7,115 @@
 #include <netinet/in.h>
 #include <netdb.h>
 #include <arpa/inet.h>
+#include <sys/stat.h> //used for tracking time and file size
+#include <time.h> //return type for time
 
 //use port 43024
 //#define ADDR "127.0.0.1"   // loop back to this machine
 #define ADDR "127.0.0.1"
 #define BACKLOG 3    // How many addresses we store
+#define SEND_FILE "blockchain.txt"
+//needed for making file
+int init_file(const char *path)
+{
+	FILE *fp = fopen(path, "a"); //"a" will create or open
+	if(fp == NULL) {
+		perror("init_file");
+		return -1;
+	}
+	fclose(fp);
+	return 0;
+}
+//will put a line of data on the file
+int add_block(const char *path, const char *data)
+{
+	FILE *fp = fopen(path, "a"); //assuming it exists will write to end
+	if(fp == NULL) {
+		perror("fail in add_block");
+		return -1;
+	}
+	fprintf(fp, "%s\n", data);
+	fclose(fp);
+	return 0;
+}
+ 
+//will get the size using stat object
+long file_size(const char *path)
+{
+	struct stat st;
+	if(stat(path, &st) == -1) {
+		return -1;
+	}
+	return (long)st.st_size;
+}
+ 
+//gets time modiefied
+time_t file_mtime(const char *path)
+{
+	struct stat st;
+	if(stat(path, &st) == -1) {
+		return -1;
+	}
+	return st.st_mtime;
+}
+ 
+//reads file puts in buffer to return.  does not free
+char *read_file(const char *path, long *len)
+{
+	long size = file_size(path);
+	if(size < 0) {
+		return NULL;
+	}
+ 
+	FILE *fp = fopen(path, "rb"); //read only in binary
+	if(fp == NULL) {
+		perror("read_file");
+		return NULL;
+	}
+ 
+	char *buf = malloc(size + 1); //+1 for end character
+	if(buf == NULL) {
+		fclose(fp);
+		return NULL;
+	}
+ 
+	size_t need = fread(buf, 1, size, fp); //reading and putting in buf
+	fclose(fp);
+ 
+	buf[need] = '\0'; //end character to buf
+	*len = (long)need; //writes to len 
+	return buf;
+}
+ 
+//makes temp write file and replaces original when done. saves us from crashes
+int write_file(const char *path, const char *buf, long len)
+{
+	char tmp[256];
+	snprintf(tmp, sizeof tmp, "%s.tmp", path); //makes temp blockchain
+ 
+	FILE *fp = fopen(tmp, "wb"); //w erases whatever was there NOT a
+	if(fp == NULL) {
+		perror("write_file");
+		return -1;
+	}
+ 
+	if(fwrite(buf, 1, len, fp) != (size_t)len) { //will write len items and returns amount written
+		perror("fwrite");
+		fclose(fp);
+		remove(tmp);
+		return -1;
+	}
+	fclose(fp);
+ 
+	if(rename(tmp, path) == -1) { //swap as normal blockchain everything works!
+		perror("rename");
+		return -1;
+	}
+	return 0;
+}
+ 
+
+
 int listening(char *port){
 	struct sockaddr_in addr;
 	int yes = 1;
@@ -79,11 +183,19 @@ int connecting(char *port)
 
 int main(int argc, char *argv[])
 {
+	if(init_file(SEND_FILE) == -1) {
+		return 1;
+	}
 
 //HOSTING 
 	if(argc == 3 && strcmp(argv[1], "host") == 0) { // checks to see three args and if 3rd is host
 		char *port = argv[2]; //second has port num
 		int listener = listening(port);
+		if(listener == -1)
+		{
+			printf(stderr, "listen failed");
+			return 2;
+		}
 		printf("Host listening on %s\n", port);
 		
 		//look at phase one
@@ -110,7 +222,7 @@ int main(int argc, char *argv[])
         	}
 
  		//reciever from phase 1
-        	char *reply = "This is host from port: %s\n", port;
+        	char *reply = "This is host from port\n";
         	if (send(new_fd, reply, strlen(reply), 0) == -1) {
             		perror("send");
         	}
@@ -135,7 +247,7 @@ int main(int argc, char *argv[])
 		printf("Connection established %d\n", sockfd);
 		
 		//Similar message sender from phase1
-		char *msg = "Hey! this is on port %s\n", port; //tries to send message on connect
+		char *msg = "Hey! this is connecter\n"; //tries to send message on connect
         	if (send(sockfd, msg, strlen(msg), 0) == -1) {
             		perror("send");
         	}
