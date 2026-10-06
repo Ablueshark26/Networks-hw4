@@ -9,12 +9,23 @@
 #include <arpa/inet.h>
 #include <sys/stat.h> //used for tracking time and file size
 #include <time.h> //return type for time
+#include <stdint.h> //usage for special integer 32 bit
+#include <pthread.h> //thread
 
 //use port 43024
 //#define ADDR "127.0.0.1"   // loop back to this machine
 #define ADDR "127.0.0.1"
 #define BACKLOG 3    // How many addresses we store
 #define SEND_FILE "blockchain.txt"
+#define MAX_SIZE 1000000 //10mb max
+
+//start threading
+pthread_mutex_t file_lock = PTHREAD_MUTEX_INITIALIZER;
+time_t saved_mtime; //last save
+int running = 0;  //check when threads are running
+
+
+
 //needed for making file
 int init_file(const char *path)
 {
@@ -86,34 +97,206 @@ char *read_file(const char *path, long *len)
 	*len = (long)need; //writes to len 
 	return buf;
 }
- 
 //makes temp write file and replaces original when done. saves us from crashes
 int write_file(const char *path, const char *buf, long len)
 {
-	char tmp[256];
-	snprintf(tmp, sizeof tmp, "%s.tmp", path); //makes temp blockchain
- 
-	FILE *fp = fopen(tmp, "wb"); //w erases whatever was there NOT a
-	if(fp == NULL) {
-		perror("write_file");
-		return -1;
-	}
- 
-	if(fwrite(buf, 1, len, fp) != (size_t)len) { //will write len items and returns amount written
-		perror("fwrite");
-		fclose(fp);
-		remove(tmp);
-		return -1;
-	}
-	fclose(fp);
- 
-	if(rename(tmp, path) == -1) { //swap as normal blockchain everything works!
-		perror("rename");
-		return -1;
+        char tmp[256];
+        snprintf(tmp, sizeof tmp, "%s.tmp", path); //makes temp blockchain
+
+        FILE *fp = fopen(tmp, "wb"); //w erases whatever was there NOT a
+        if(fp == NULL) {
+                perror("write_file");
+                return -1;
+        }
+
+        if(fwrite(buf, 1, len, fp) != (size_t)len) { //will write len items and returns amount written
+                perror("fwrite");
+                fclose(fp);
+                remove(tmp);
+                return -1;
+        }
+        fclose(fp);
+
+        if(rename(tmp, path) == -1) { //swap as normal blockchain everything works!
+                perror("rename");
+                return -1;
+        }
+        return 0;
+}
+//will send until it matches the len of file
+int sendall(int fd, const char *buf, long len)
+{
+	long total = 0; //keep track of bytes sent
+	while(total < len) {
+		ssize_t n = send(fd, buf + total, len - total, 0);  //counts size sent
+		if(n == -1) {
+			perror("sendall");
+			return -1;
+		}
+		total += n;
 	}
 	return 0;
 }
+
+//recieve looks the same jsut checks zero 
+int recvall(int fd, char *buf, long len)
+{
+	long total = 0;
+	while(total < len) {
+		ssize_t n = recv(fd, buf + total, len - total, 0);
+		if(n == -1) {
+			perror("recvall");
+			return -1;
+		}
+		if(n == 0) { //0 means they closed the connection
+			fprintf(stderr, "recvall: connection closed early\n");
+			return -1;
+		}
+		total += n;
+	}
+	return 0;
+}
+
+//send data  
+int send_data(int fd, const char *data, long len)
+{
+	uint32_t netlen = htonl((uint32_t)len); //size in network byte order, like the port
+	if(sendall(fd, (char *)&netlen, sizeof netlen) == -1) {
+		return -1;
+	}
+	return sendall(fd, data, len);
+}
+
+//sends our blockchain.txt as: 4byte
+int send_file(int fd)
+{
+	long len;
+	pthread_mutex_lock(&file_lock); //file lock
+	char *data = read_file(SEND_FILE, &len);
+	pthread_mutex_unlock(&file_lock);
+	if(data == NULL) {
+		return -1;
+	}
  
+	int rv = send_data(fd, data, len); //the slow network part happens OUTSIDE the lock
+	free(data); //freeing from read_file
+	return rv;
+}
+ 
+
+//receives a file sent adn  saves it as our blockchain.txt
+
+int recv_file(int fd)
+{
+	uint32_t netlen;
+	if(recvall(fd, (char *)&netlen, sizeof netlen) == -1) { //first the size
+		return -1;
+	}
+	long len = ntohl(netlen);
+	if(len > MAX_SIZE) { //test size
+		fprintf(stderr, "recv_file: size %ld too big\n", len);
+		return -1;
+	}
+ 
+	char *data = malloc(len + 1);
+	if(data == NULL) {
+		return -1;
+	}
+ 
+	if(recvall(fd, data, len) == -1) { //then the bytes, again OUTSIDE the lock
+		free(data);
+		return -1;
+	}
+ 
+	pthread_mutex_lock(&file_lock);
+	int rv = write_file(SEND_FILE, data, len);
+	saved_mtime = file_mtime(SEND_FILE); //write to main
+	pthread_mutex_unlock(&file_lock); //(this one line is what stops the feedback loop)
+	free(data);
+	return rv;
+}
+void *receiver(void *arg)
+{
+	int fd = *(int *)arg;
+	while(1) {
+		if(recv_file(fd) == -1) { //error, or the other peer hung up
+			break;
+		}
+		printf("Received updated %s (%ld bytes)\n", SEND_FILE, file_size(SEND_FILE));
+	}
+	printf("Peer disconnected.\n");
+ 
+	pthread_mutex_lock(&file_lock);
+	running = 0; //tells the monitor to stop
+	pthread_mutex_unlock(&file_lock);
+	return NULL;
+}
+ 
+//thread: checks the file about once a second and sends it if it changed locally
+void *monitor(void *arg)
+{
+	int fd = *(int *)arg;
+	while(1) {
+		sleep(1);
+ 
+		char *data = NULL;
+		long len = 0;
+		pthread_mutex_lock(&file_lock);
+		if(!running) {
+			pthread_mutex_unlock(&file_lock);
+			break;
+		}
+		time_t now = file_mtime(SEND_FILE);
+		if(now != saved_mtime) { //somebody edited the file
+			saved_mtime = now;
+			data = read_file(SEND_FILE, &len);
+		}
+		pthread_mutex_unlock(&file_lock);
+ 
+		if(data != NULL) { //send OUTSIDE the lock
+			printf("Local change detected, sending %s (%ld bytes)\n", SEND_FILE, len);
+			int rv = send_data(fd, data, len);
+			free(data);
+			if(rv == -1) {
+				fprintf(stderr, "Could not send update.\n");
+				break;
+			}
+		}
+	}
+ 
+	pthread_mutex_lock(&file_lock);
+	running = 0;
+	pthread_mutex_unlock(&file_lock);
+	shutdown(fd, SHUT_RDWR); //wakes the receiver if it is stuck waiting in recv()
+	return NULL;
+}
+ 
+//both modes end up here once the first file has been exchanged
+void run_peer(int fd)
+{
+	pthread_mutex_lock(&file_lock);
+	saved_mtime = file_mtime(SEND_FILE); //anything up to now is not a new change
+	pthread_mutex_unlock(&file_lock);
+ 
+	pthread_t recv_tid, mon_tid;
+	if(pthread_create(&recv_tid, NULL, receiver, &fd) != 0) {
+		fprintf(stderr, "could not start receiver thread\n");
+		close(fd);
+		return;
+	}
+	if(pthread_create(&mon_tid, NULL, monitor, &fd) != 0) {
+		fprintf(stderr, "could not start monitor thread\n");
+		shutdown(fd, SHUT_RDWR);
+		pthread_join(recv_tid, NULL);
+		close(fd);
+		return;
+	}
+ 
+	printf("Peer is running. Edit %s to send an update, Ctrl-C to quit.\n", SEND_FILE);
+	pthread_join(recv_tid, NULL); //wait here until the connection ends
+	pthread_join(mon_tid, NULL);
+	close(fd);
+}
 
 
 int listening(char *port){
@@ -193,7 +376,7 @@ int main(int argc, char *argv[])
 		int listener = listening(port);
 		if(listener == -1)
 		{
-			printf(stderr, "listen failed");
+			fprintf(stderr, "listen failed");
 			return 2;
 		}
 		printf("Host listening on %s\n", port);
@@ -213,23 +396,17 @@ int main(int argc, char *argv[])
 		inet_ntop(AF_INET, &other_addr.sin_addr, ip, sizeof ip);
         	printf("Connection from %s (fd %d)\n", ip, new_fd);
 		
-		//similar char buf to how we've seen 
-		char buf[100];
-        	int numbytes = recv(new_fd, buf, sizeof buf - 1, 0);
-        	if (numbytes > 0) {
-            		buf[numbytes] = '\0';
-            		printf("Received: %s", buf);
-        	}
-
- 		//reciever from phase 1
-        	char *reply = "This is host from port\n";
-        	if (send(new_fd, reply, strlen(reply), 0) == -1) {
-            		perror("send");
-        	}
+		//new part host will send the file b4 connector speaks
+		printf("Sending %s (%ld bytes)\n", SEND_FILE, file_size(SEND_FILE));
+		if(send_file(new_fd) == -1) {
+			fprintf(stderr, "Could not send file.\n");
+			return 2;
+		}
+		printf("File sent \n");
  		
-		//close out the sockets made 
-	        close(new_fd);
+		//close out the sockets made
 	        close(listener);
+		run_peer(new_fd); //defined earlier will keep sync
 	
 }
 
@@ -245,25 +422,20 @@ int main(int argc, char *argv[])
     			return 2;
 		}
 		printf("Connection established %d\n", sockfd);
-		
-		//Similar message sender from phase1
-		char *msg = "Hey! this is connecter\n"; //tries to send message on connect
-        	if (send(sockfd, msg, strlen(msg), 0) == -1) {
-            		perror("send");
-        	}
- 		//gets message from host
-                char buf[100];
-                int numbytes = recv(sockfd, buf, sizeof buf - 1, 0);
-                if (numbytes > 0) {
-                        buf[numbytes] = '\0';
-                        printf("Host: %s", buf);
-                }
+		//tries to get file from host 
+		if(recv_file(sockfd) == -1) {
+			fprintf(stderr, "Could not receive file.\n");
+			return 2;
+		} 
  
-        	close(sockfd);
+ 		//gets message from host
+        	printf("Received %s (%ld bytes)\n", SEND_FILE, file_size(SEND_FILE));
+ 
+		run_peer(sockfd); //keeping socket open 
 	}
 
         else{ //mistakes
-                fprintf(stderr, "improper call");
+                fprintf(stderr, "improper call\n");
                 return 1;
         }
         return 0;
